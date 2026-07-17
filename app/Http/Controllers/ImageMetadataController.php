@@ -2,14 +2,17 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\ImageBatchProcessed;
+use App\Jobs\StripImageMetadataJob;
+use App\Models\ImageBatchResult;
+use Illuminate\Bus\Batch;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rules\File;
-use Intervention\Image\Encoders\PngEncoder;
-use Intervention\Image\ImageManager;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use ZipArchive;
@@ -25,32 +28,65 @@ class ImageMetadataController extends Controller
                 'file',
                 File::default()
                     ->extensions(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'heic', 'heif', 'dng'])
-                    ->max(102400),
+                    ->max(524288),
             ],
         ]);
 
-        // Imagick (vía libraw) puede decodificar formatos RAW como DNG, además de
-        // los formatos estándar; GD no soporta RAW en absoluto.
-        $manager = ImageManager::imagick();
-        $results = [];
+        // Carpeta puramente interna para los temporales; no tiene relación con
+        // el ID de batch real, que Laravel recién asigna al hacer dispatch().
+        $uploadId = (string) Str::uuid();
 
-        // Se procesan todas las imágenes de forma síncrona antes de responder,
-        // ya que el frontend espera el resultado completo en una única respuesta.
-        foreach ($request->file('images') as $file) {
-            $image = $manager->read($file->getRealPath());
+        // Los archivos subidos viven en un tmp del request; se guardan en el
+        // disco local para que los jobs en cola puedan leerlos después,
+        // incluso una vez terminada esta request HTTP.
+        //
+        // Ojo: se guarda con extensión .tmp a propósito (no la original). Con
+        // .dng/.DNG, Imagick fuerza su decoder RAW (libraw), que falla en
+        // algunos DNG de iPhone (ProRAW); sin esa pista de extensión, Imagick
+        // detecta el formato por los magic bytes y cae en un decoder más
+        // robusto que además puede aprovechar el preview JPEG embebido.
+        $jobs = collect($request->file('images'))->map(function ($file) use ($uploadId) {
+            $tempPath = $file->storeAs(
+                "uploads/{$uploadId}",
+                Str::uuid().'.tmp',
+                'local'
+            );
 
-            $path = 'cleaned/'.Str::uuid().'.png';
+            return new StripImageMetadataJob($tempPath, $file->getClientOriginalName());
+        });
 
-            Storage::disk('s3')->put($path, (string) $image->encode(new PngEncoder()), 'public');
+        $batch = Bus::batch($jobs)
+            ->name("strip-metadata-{$uploadId}")
+            ->allowFailures()
+            ->finally(function (Batch $batch) {
+                ImageBatchProcessed::dispatch($batch->id, $batch->hasFailures());
+            })
+            ->dispatch();
 
-            $results[] = [
-                'original_name' => $file->getClientOriginalName(),
-                'path' => $path,
-                'url' => Storage::disk('s3')->url($path),
-            ];
-        }
+        return response()->json(['batch_id' => $batch->id], Response::HTTP_ACCEPTED);
+    }
 
-        return response()->json(['images' => $results]);
+    public function batchStatus(string $batchId): JsonResponse
+    {
+        $batch = Bus::findBatch($batchId);
+
+        abort_unless($batch, Response::HTTP_NOT_FOUND);
+
+        $images = ImageBatchResult::query()
+            ->where('batch_id', $batchId)
+            ->get(['original_name', 'path', 'url']);
+
+        return response()->json([
+            'status' => match (true) {
+                $batch->cancelled() => 'cancelled',
+                $batch->finished() => 'finished',
+                default => 'processing',
+            },
+            'total' => $batch->totalJobs,
+            'processed' => $batch->processedJobs(),
+            'failed' => $batch->failedJobs,
+            'images' => $images,
+        ]);
     }
 
     public function download(Request $request): StreamedResponse

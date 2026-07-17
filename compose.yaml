@@ -1,7 +1,7 @@
 services:
     laravel.test:
         build:
-            context: './vendor/laravel/sail/runtimes/8.5'
+            context: './docker/8.5'
             dockerfile: Dockerfile
             args:
                 WWWGROUP: '${WWWGROUP}'
@@ -24,6 +24,38 @@ services:
         depends_on:
             - mysql
             - minio
+    queue:
+        image: 'sail-8.5/app'
+        environment:
+            WWWUSER: '${WWWUSER}'
+            LARAVEL_SAIL: 1
+        volumes:
+            - '.:/var/www/html'
+        networks:
+            - sail
+        depends_on:
+            - laravel.test
+            - mysql
+            - minio
+        command: 'php artisan queue:work --tries=1'
+        # Varias réplicas para procesar en paralelo los jobs de un mismo batch
+        # (antes un solo worker procesaba las imágenes de a una, secuencialmente).
+        deploy:
+            replicas: 4
+    reverb:
+        image: 'sail-8.5/app'
+        environment:
+            WWWUSER: '${WWWUSER}'
+            LARAVEL_SAIL: 1
+        ports:
+            - '${REVERB_PORT:-8080}:8080'
+        volumes:
+            - '.:/var/www/html'
+        networks:
+            - sail
+        depends_on:
+            - laravel.test
+        command: 'php artisan reverb:start'
     mysql:
         image: 'mysql:8.4'
         ports:
@@ -38,7 +70,7 @@ services:
             MYSQL_EXTRA_OPTIONS: '${MYSQL_EXTRA_OPTIONS:-}'
         volumes:
             - 'sail-mysql:/var/lib/mysql'
-            - './vendor/laravel/sail/database/mysql/create-testing-database.sh:/docker-entrypoint-initdb.d/10-create-testing-database.sh'
+            - './docker/mysql/create-testing-database.sh:/docker-entrypoint-initdb.d/10-create-testing-database.sh'
         networks:
             - sail
         healthcheck:
